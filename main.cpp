@@ -353,152 +353,62 @@ int main(void) {
             while (true) { core::watchdog::feed(main_wdt); poll_poweroff(); k_sleep(K_MSEC(100)); }
         }
 
-        // FAIL: T1 blinks stage, T2 blinks sub-error
+        // Helper: sleep 800ms, then blink `count` pulses on track LED `led`.
+        auto blink_count = [&](int led, int count) {
+            k_sleep(K_MSEC(800));
+            core::watchdog::feed(main_wdt);
+            poll_poweroff();
+            for (int b = 0; b < count; ++b) {
+                g_leds.set_track(led, 255); k_sleep(K_MSEC(300));
+                g_leds.set_track(led, 0);   k_sleep(K_MSEC(300));
+                core::watchdog::feed(main_wdt);
+                poll_poweroff();
+            }
+        };
+
+        // FAIL: T1 = fail_stage count. T2/T3/T4 = sub-error detail.
+        // T2/T3/T4 blink count = nibble_value + 1 (1 blink = nibble 0, 16 = nibble 15).
+        // Exception: write-response-token T3 uses raw count (1=CRC error, 2=write error).
         while (true) {
             core::watchdog::feed(main_wdt);
             poll_poweroff();
+
             for (int b = 0; b < fail_stage; ++b) {
                 g_leds.set_track(0, 255); k_sleep(K_MSEC(300));
                 g_leds.set_track(0, 0);   k_sleep(K_MSEC(300));
                 core::watchdog::feed(main_wdt);
                 poll_poweroff();
             }
-            k_sleep(K_MSEC(800));
-            core::watchdog::feed(main_wdt);
-            poll_poweroff();
+
             int t2 = 0;
             if (fail_stage == 2) t2 = emmc.last_write_error;
-            if (fail_stage == 4) t2 = (fail_byte >= 0) ? ((fail_byte >> 8) & 0xF) : 0;
-            if (fail_stage == 5) t2 = (spot_actual >> 4) & 0x0F;  // upper nibble of actual flash byte
+            if (fail_stage == 4 && fail_byte >= 0) t2 = (fail_byte >> 8) & 0xF;
+            if (fail_stage == 5) t2 = (spot_actual >> 4) & 0x0F;
             if (fail_stage == 6) t2 = emmc.last_write_error;
-            if (fail_stage == 7 && fail_byte >= 0) t2 = ((fail_byte & 0xFF) >> 5) & 0x7;  // 0..7 covering byte positions in 32-byte chunks
-            for (int b = 0; b < t2 + 1; ++b) {
-                g_leds.set_track(1, 255); k_sleep(K_MSEC(300));
-                g_leds.set_track(1, 0);   k_sleep(K_MSEC(300));
-                core::watchdog::feed(main_wdt);
-                poll_poweroff();
-            }
-            // T3/T4: blink high byte of R1 as two nibbles when CMD25 returned R1 error
-            // T3 = bits 31-28 of R1 (upper nibble), T4 = bits 27-24 of R1 (lower nibble)
+            if (fail_stage == 7 && fail_byte >= 0) t2 = ((fail_byte & 0xFF) >> 5) & 0x7;
+            blink_count(1, t2 + 1);
+
             if (fail_stage == 2 && emmc.last_write_error == 11) {
-                k_sleep(K_MSEC(800));
-                core::watchdog::feed(main_wdt);
-                poll_poweroff();
-                const int t3 = static_cast<int>((emmc.last_failed_block_index >> 28) & 0x0F);
-                for (int b = 0; b < t3 + 1; ++b) {
-                    g_leds.set_track(2, 255); k_sleep(K_MSEC(300));
-                    g_leds.set_track(2, 0);   k_sleep(K_MSEC(300));
-                    core::watchdog::feed(main_wdt);
-                    poll_poweroff();
-                }
-                k_sleep(K_MSEC(800));
-                core::watchdog::feed(main_wdt);
-                poll_poweroff();
-                const int t4 = static_cast<int>((emmc.last_failed_block_index >> 24) & 0x0F);
-                for (int b = 0; b < t4 + 1; ++b) {
-                    g_leds.set_track(3, 255); k_sleep(K_MSEC(300));
-                    g_leds.set_track(3, 0);   k_sleep(K_MSEC(300));
-                    core::watchdog::feed(main_wdt);
-                    poll_poweroff();
-                }
+                // CMD25 R1 error: blink bits 31-24 of R1 as two nibbles
+                blink_count(2, ((emmc.last_failed_block_index >> 28) & 0xF) + 1);
+                blink_count(3, ((emmc.last_failed_block_index >> 24) & 0xF) + 1);
             }
-            // T3/T4: actual wrong byte value returned by CMD18 at rbuf[fail_byte].
-            // T2 = upper nibble of fail_byte index (still shows WHICH byte failed).
-            // T3 = upper nibble of actual CMD18 value, T4 = lower nibble.
-            // Decode: actual = (T3 << 4) | T4. Expected block 1 byte 0 = 0x26.
+            if ((fail_stage == 2 || fail_stage == 6) && emmc.last_write_error == 4) {
+                // Write response token: 1=CRC error (0b101), 2=write error (0b110)
+                blink_count(2, (emmc.last_write_response_status == 0b101U) ? 1 : 2);
+            }
             if (fail_stage == 4 && fail_byte >= 0) {
-                k_sleep(K_MSEC(800));
-                core::watchdog::feed(main_wdt);
-                poll_poweroff();
-                const int t3 = (rbuf_bad_byte >> 4) & 0x0F;
-                for (int b = 0; b < t3 + 1; ++b) {
-                    g_leds.set_track(2, 255); k_sleep(K_MSEC(300));
-                    g_leds.set_track(2, 0);   k_sleep(K_MSEC(300));
-                    core::watchdog::feed(main_wdt);
-                    poll_poweroff();
-                }
-                k_sleep(K_MSEC(800));
-                core::watchdog::feed(main_wdt);
-                poll_poweroff();
-                const int t4 = rbuf_bad_byte & 0x0F;
-                for (int b = 0; b < t4 + 1; ++b) {
-                    g_leds.set_track(3, 255); k_sleep(K_MSEC(300));
-                    g_leds.set_track(3, 0);   k_sleep(K_MSEC(300));
-                    core::watchdog::feed(main_wdt);
-                    poll_poweroff();
-                }
+                blink_count(2, (rbuf_bad_byte >> 4) + 1);
+                blink_count(3, (rbuf_bad_byte & 0xF) + 1);
             }
-            // fail_stage=5: block 1 wrong via CMD17 (write confirmed bad).
-            // T2 = upper nibble of actual flash byte (already blinked above).
-            // T3 = lower nibble of actual flash byte.
-            // Decode: actual = (T2 << 4) | T3.
-            // Expected block 1 byte 0 = 0x26 (block-unique pattern).
-            // 0xFF = never written (erased state). 0x5A = old repeating-pattern data.
             if (fail_stage == 5) {
-                k_sleep(K_MSEC(800));
-                core::watchdog::feed(main_wdt);
-                poll_poweroff();
-                const int t3_spot = spot_actual & 0x0F;
-                for (int b = 0; b < t3_spot + 1; ++b) {
-                    g_leds.set_track(2, 255); k_sleep(K_MSEC(300));
-                    g_leds.set_track(2, 0);   k_sleep(K_MSEC(300));
-                    core::watchdog::feed(main_wdt);
-                    poll_poweroff();
-                }
+                blink_count(2, (spot_actual & 0xF) + 1);
             }
-            // T3×1 = CRC error (0b101), T3×2 = write error (0b110)
-            if (fail_stage == 2 && emmc.last_write_error == 4) {
-                k_sleep(K_MSEC(800));
-                core::watchdog::feed(main_wdt);
-                poll_poweroff();
-                const int t3 = (emmc.last_write_response_status == 0b101U) ? 1 : 2;
-                for (int b = 0; b < t3; ++b) {
-                    g_leds.set_track(2, 255); k_sleep(K_MSEC(300));
-                    g_leds.set_track(2, 0);   k_sleep(K_MSEC(300));
-                    core::watchdog::feed(main_wdt);
-                    poll_poweroff();
-                }
-            }
-            // fail_stage=7: CMD24 readback mismatch — same shape as stage 4.
-            // T2 (already blinked) = upper nibble of fail_byte index.
-            // T3 = upper nibble of actual readback byte, T4 = lower nibble.
-            // Decode: actual = (T3 << 4) | T4. Expected = (c24_block * 37 + fail_byte + 1) & 0xFF.
             if (fail_stage == 7 && fail_byte >= 0) {
-                k_sleep(K_MSEC(800));
-                core::watchdog::feed(main_wdt);
-                poll_poweroff();
-                const int t3 = (c24_actual >> 4) & 0x0F;
-                for (int b = 0; b < t3 + 1; ++b) {
-                    g_leds.set_track(2, 255); k_sleep(K_MSEC(300));
-                    g_leds.set_track(2, 0);   k_sleep(K_MSEC(300));
-                    core::watchdog::feed(main_wdt);
-                    poll_poweroff();
-                }
-                k_sleep(K_MSEC(800));
-                core::watchdog::feed(main_wdt);
-                poll_poweroff();
-                const int t4 = c24_actual & 0x0F;
-                for (int b = 0; b < t4 + 1; ++b) {
-                    g_leds.set_track(3, 255); k_sleep(K_MSEC(300));
-                    g_leds.set_track(3, 0);   k_sleep(K_MSEC(300));
-                    core::watchdog::feed(main_wdt);
-                    poll_poweroff();
-                }
+                blink_count(2, (c24_actual >> 4) + 1);
+                blink_count(3, (c24_actual & 0xF) + 1);
             }
-            // fail_stage=6: CMD24 write failure. Mirror stage 2's badstatus sub-case.
-            // T3×1 = CRC error (0b101), T3×2 = write error (0b110), only when last_write_error == 4.
-            if (fail_stage == 6 && emmc.last_write_error == 4) {
-                k_sleep(K_MSEC(800));
-                core::watchdog::feed(main_wdt);
-                poll_poweroff();
-                const int t3 = (emmc.last_write_response_status == 0b101U) ? 1 : 2;
-                for (int b = 0; b < t3; ++b) {
-                    g_leds.set_track(2, 255); k_sleep(K_MSEC(300));
-                    g_leds.set_track(2, 0);   k_sleep(K_MSEC(300));
-                    core::watchdog::feed(main_wdt);
-                    poll_poweroff();
-                }
-            }
+
             k_sleep(K_MSEC(800));
             core::watchdog::feed(main_wdt);
             poll_poweroff();
