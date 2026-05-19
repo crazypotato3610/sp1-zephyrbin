@@ -15,7 +15,6 @@ extern "C" {
 #include <ump_stream_responder.h>
 }
 
-#include "AppStateMachine.hpp"
 #include "Leds.hpp"
 #include "MidiController.hpp"
 #include "power/PowerManager.hpp"
@@ -519,37 +518,4 @@ int main(void) {
             k_sleep(K_MSEC(700));
         }
     }
-
-    // ── Fader ADC ───────────────────────────────────────────────
-    for (const auto* spec : {&fader1_adc, &fader2_adc, &fader3_adc, &fader4_adc}) {
-        if (adc_is_ready_dt(spec)) {
-            adc_channel_setup_dt(spec);
-        }
-    }
-    core::watchdog::feed(main_wdt);
-
-    // ── MIDI controller ─────────────────────────────────────────
-    g_midi.midi_dev = midi_dev;
-    g_midi.track_led_pwm = g_leds.track.data();
-    g_midi.fader_adc = {fader1_adc, fader2_adc, fader3_adc, fader4_adc};
-
-    if (device_is_ready(midi_dev)) {
-        usbd_midi_set_ops(midi_dev, &midi_ops);
-        LOG_INF("USB MIDI configured");
-    } else {
-        LOG_ERR("MIDI device not ready");
-    }
-    core::watchdog::feed(main_wdt);
-
-    // ── Start HSM ───────────────────────────────────────────────
-    app::AppMachine machine{};
-    machine.midi = &g_midi;
-    machine.leds = &g_leds;
-    machine.power = &g_power;
-    machine.main_watchdog_channel = main_wdt;
-
-    LOG_INF("Boot complete, entering HSM");
-    app::run(machine);
-
-    return 0;
 }
