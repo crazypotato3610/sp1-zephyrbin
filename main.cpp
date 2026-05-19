@@ -406,9 +406,6 @@ int main(void) {
             // T2 = upper nibble of fail_byte index (still shows WHICH byte failed).
             // T3 = upper nibble of actual CMD18 value, T4 = lower nibble.
             // Decode: actual = (T3 << 4) | T4. Expected block 1 byte 0 = 0x26.
-            // 0xFF = DMA never reached that address (block not received).
-            // 0x01 = block 0's byte 0 (CMD18 sent block 0 twice instead of advancing).
-            // 0x13 = 0x26 >> 1 (1-bit right shift = start-bit alignment off by 1).
             if (fail_stage == 4 && fail_byte >= 0) {
                 k_sleep(K_MSEC(800));
                 core::watchdog::feed(main_wdt);
@@ -465,7 +462,7 @@ int main(void) {
             // fail_stage=7: CMD24 readback mismatch — same shape as stage 4.
             // T2 (already blinked) = upper nibble of fail_byte index.
             // T3 = upper nibble of actual readback byte, T4 = lower nibble.
-            // Decode: actual = (T3 << 4) | T4. Expected = (fail_byte ^ 0xA5).
+            // Decode: actual = (T3 << 4) | T4. Expected = (c24_block * 37 + fail_byte + 1) & 0xFF.
             if (fail_stage == 7 && fail_byte >= 0) {
                 k_sleep(K_MSEC(800));
                 core::watchdog::feed(main_wdt);
