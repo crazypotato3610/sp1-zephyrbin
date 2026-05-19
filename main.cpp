@@ -1,13 +1,10 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/pwm.h>
-#include <zephyr/drivers/uart.h>
 #include <zephyr/input/input.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_midi2.h>
-#include <zephyr/usb/bos.h>
 #include <hal/nrf_power.h>
 #include <zephyr/sys/poweroff.h>
 
@@ -80,13 +77,6 @@ static struct usbd_context *init_usb(void) {
 
 #define USB_MIDI_DT_NODE DT_NODELABEL(usb_midi)
 static const struct device *const midi_dev = DEVICE_DT_GET(USB_MIDI_DT_NODE);
-
-// ── Fader ADC channels ──────────────────────────────────────────
-
-static const struct adc_dt_spec fader1_adc = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), fader1);
-static const struct adc_dt_spec fader2_adc = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), fader2);
-static const struct adc_dt_spec fader3_adc = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), fader3);
-static const struct adc_dt_spec fader4_adc = ADC_DT_SPEC_GET_BY_NAME(DT_PATH(zephyr_user), fader4);
 
 // ── Globals ─────────────────────────────────────────────────────
 
