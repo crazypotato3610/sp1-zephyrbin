@@ -56,7 +56,9 @@ public:
     bool read_blocks_sync(uint32_t block_addr, uint8_t* buffer, uint32_t num_blocks);
     bool read_blocks(uint32_t block_addr, uint8_t* buffer, uint32_t num_blocks);
     bool cmd24_write_single(uint32_t block_addr, const uint8_t* data);
-    bool test_cmd24_roundtrip();
+    bool cmd25_write_multiple(uint32_t block_addr, const uint8_t* data, uint32_t num_blocks);
+    uint32_t last_failed_block_index = 0;
+    uint8_t last_write_response_status = 0;
     bool start_read_blocks_async(uint32_t block_addr, uint8_t* buffer, uint32_t num_blocks);
     bool poll_async_read_complete(bool* success);
     bool async_read_in_flight() const;
@@ -217,6 +219,7 @@ private:
     bool read_write_response();
     bool wait_write_busy();
     bool send_data_block(const uint8_t* data, uint8_t start_token);
+    bool send_stop_tran();
 
     // Async read IRQ state — unchanged from previous implementation.
     enum class AsyncReadState : uint8_t {

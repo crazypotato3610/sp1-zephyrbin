@@ -696,6 +696,7 @@ bool EmmcDriver::spim3_receive_bytes(uint8_t* buffer, size_t length) {
 
     NRF_SPIM3->RXD.PTR = reinterpret_cast<uint32_t>(buffer);
     NRF_SPIM3->RXD.MAXCNT = length;
+    NRF_SPIM3->TXD.MAXCNT = 0;  // reset stale TX count — SPIM clocks max(TX,RX) bytes
 
     NRF_SPIM3->EVENTS_END = 0;
     NRF_SPIM3->EVENTS_ENDRX = 0;
@@ -1194,6 +1195,7 @@ bool EmmcDriver::read_write_response() {
     if (status != 0b010U) {
         LOG_ERR("eMMC: write response status=0x%x (%s)", status,
                 status == 0b101U ? "CRC error" : "write error");
+        last_write_response_status = status;
         last_write_error = 4;
         return false;
     }
@@ -1497,55 +1499,77 @@ bool EmmcDriver::cmd24_write_single(uint32_t block_addr, const uint8_t* data) {
     return send_data_block(data, 0xFE);
 }
 
-bool EmmcDriver::test_cmd24_roundtrip() {
-    if (!initialized_) {
-        LOG_ERR("CMD24 test: driver not initialized");
+bool EmmcDriver::send_stop_tran() {
+    // Must be stack-local non-const — EasyDMA cannot read from flash .rodata
+    uint8_t stop_bytes[] = {0xFF, 0xFD, 0xFF};
+    if (!spim3_transmit_bytes(stop_bytes, 3)) {
+        last_write_error = 20;
         return false;
     }
-
-    if (capacity_blocks_ < 128) {
-        LOG_ERR("CMD24 test: capacity_blocks_ = %u, implausibly small — skipping", capacity_blocks_);
+    if (!wait_write_busy()) {
+        last_write_error = 21;
         return false;
     }
-
-    // Scratch area: last 64 blocks — well past any album data
-    const uint32_t scratch_block = capacity_blocks_ - 64;
-
-    // Known test pattern: non-trivial, catches offset and bit-flip errors
-    alignas(4) static uint8_t write_buf[512];
-    for (int i = 0; i < 512; ++i) {
-        write_buf[i] = static_cast<uint8_t>(i ^ 0xA5);
-    }
-
-    LOG_INF("CMD24 test: writing to block 0x%08x", scratch_block);
-    if (!cmd24_write_single(scratch_block, write_buf)) {
-        LOG_ERR("CMD24 test: write failed");
-        return false;
-    }
-
-    // Read back using the existing CMD17 path
-    // spim3_receive_block uses an internal bounce buffer for DMA;
-    // only 512 bytes are copied here. Do NOT switch to spim3_receive_block_direct
-    // without sizing this to at least 514 bytes.
-    alignas(4) static uint8_t read_buf[512];
-    if (!cmd17_read_single(scratch_block, read_buf)) {
-        LOG_ERR("CMD24 test: read-back failed");
-        return false;
-    }
-
-    if (memcmp(write_buf, read_buf, 512) != 0) {
-        for (int i = 0; i < 512; ++i) {
-            if (write_buf[i] != read_buf[i]) {
-                LOG_ERR("CMD24 test: FAIL — first diff at byte %d: wrote 0x%02x got 0x%02x",
-                        i, write_buf[i], read_buf[i]);
-                break;
-            }
-        }
-        return false;
-    }
-
-    LOG_INF("CMD24 test: PASS — round-trip verified at block 0x%08x", scratch_block);
     return true;
+}
+
+bool EmmcDriver::cmd25_write_multiple(uint32_t block_addr, const uint8_t* data, uint32_t num_blocks) {
+    last_write_error = 0;
+    last_failed_block_index = 0;
+    if (!initialized_ || data == nullptr) return false;
+
+    // Verify card is in TRAN state before attempting multi-block write.
+    // Card state is bits [12:9] of the status register; TRAN = 4.
+    {
+        uint32_t status = 0;
+        if (!cmd13_send_status(&status)) {
+            last_write_error = 13;  // CMD13 itself got no response
+            return false;
+        }
+        const uint8_t card_state = (status >> 9) & 0x0F;
+        if (card_state != 4) {
+            last_write_error = 14;  // card not in TRAN state; state encoded in last_failed_block_index
+            last_failed_block_index = card_state;
+            return false;
+        }
+    }
+
+    if (!cmd23_set_block_count(num_blocks)) { last_write_error = 10; return false; }
+
+    uint8_t resp[6];
+    if (!send_command(25, block_addr, resp, 48)) {
+        last_write_error = 12;  // CMD25 sent, no response on CMD line (distinguish from R1 error)
+        return false;
+    }
+    const uint32_t r1 = r1_status(resp);
+    if (r1 & 0xFDF98008U) {
+        LOG_ERR("eMMC CMD25 R1 error: 0x%08x", r1);
+        last_write_error = 11;  // CMD25 responded but R1 has error bits
+        last_failed_block_index = r1;  // preserve full R1 for LED diagnostic (nibbles blinked on T3/T4)
+        return false;
+    }
+
+    for (uint32_t i = 0; i < num_blocks; i++) {
+        if (!send_data_block(data + i * 512, 0xFE)) {
+            last_failed_block_index = i + 1;
+            int saved_err = last_write_error;
+            cmd12_stop_transmission();
+            last_write_error = saved_err;  // preserve block-level error; CMD12 cleanup error is secondary
+            return false;
+        }
+    }
+
+    // CMD23 auto-terminates CMD25 after the last block.  DAT0 busy inside send_data_block
+    // only means "ready for next block," not "flash write complete."  Poll CMD13 until the
+    // card leaves PRG state and reaches TRAN (4), confirming all blocks are committed.
+    for (int polls = 0; polls < 500; polls++) {
+        uint32_t status = 0;
+        if (!cmd13_send_status(&status)) break;
+        if (((status >> 9) & 0x0F) == 4) return true;  // TRAN state: done
+        k_sleep(K_MSEC(1));
+    }
+    last_write_error = 24;  // PRG state timeout: card never reached TRAN
+    return false;
 }
 
 } // namespace hardware

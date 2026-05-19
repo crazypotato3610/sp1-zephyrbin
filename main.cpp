@@ -9,6 +9,7 @@
 #include <zephyr/usb/class/usbd_midi2.h>
 #include <zephyr/usb/bos.h>
 #include <hal/nrf_power.h>
+#include <zephyr/sys/poweroff.h>
 
 extern "C" {
 #include <ump_stream_responder.h>
@@ -243,8 +244,14 @@ int main(void) {
     k_sleep(K_MSEC(3000));
     core::watchdog::feed(main_wdt);
 
-    // ── eMMC CMD24 round-trip self-test ─────────────────────────
+    // Power monitor must start before the test block so the function-button
+    // long-press power-off handler is active even if the test loops forever.
+    g_power.init();
+    core::watchdog::feed(main_wdt);
+
+    // ── eMMC CMD25 multi-block write+read+verify self-test ──────
     // fail_stage: 0=pass 1=init 2=write 3=read 4=mismatch
+    // T2/T3/T4: stage 2 → last_write_error (+R1 nibbles); stage 4 → fail_byte as three 4-bit nibbles (T2<<8|T3<<4|T4)
     {
         static hardware::EmmcDriver emmc;
         const gpio_dt_spec emmc_supply =
@@ -254,65 +261,188 @@ int main(void) {
         emmc.configure_control_gpios(emmc_supply, emmc_reset);
 
         int fail_stage = 0;
+        int fail_byte = -1;
+        uint8_t spot_actual = 0;    // actual byte at block 1 byte 0 from CMD17 (for fail_stage=5)
+        uint8_t rbuf_bad_byte = 0;  // actual wrong byte from CMD18 at rbuf[fail_byte] (for fail_stage=4)
+        uint32_t test_block = 0;
+
+        alignas(4) static uint8_t wbuf[4096];
+        alignas(4) static uint8_t rbuf[4098];  // +2: DMA may bleed past last block
+        alignas(4) static uint8_t sblk[512];   // single-block spot-check buffer (CMD17)
+
+        // Block-unique pattern: block b, byte j → ((b * 37 + j + 1) & 0xFF)
+        // Block 0 byte 0 = 0x01, block 1 byte 0 = 0x26, block 2 = 0x4B, ...
+        // Each block's first byte is distinct so we can tell which block failed and read the actual flash value.
+        for (int i = 0; i < 4096; ++i)
+            wbuf[i] = static_cast<uint8_t>(((uint32_t)(i >> 9) * 37u + (uint32_t)(i & 0xFF) + 1u) & 0xFFu);
 
         if (!emmc.init()) {
             fail_stage = 1;
-        }
-        core::watchdog::feed(main_wdt);
-
-        if (fail_stage == 0) {
-            const uint32_t scratch = emmc.capacity_blocks() - 64;
-            alignas(4) static uint8_t wbuf[512];
-            alignas(4) static uint8_t rbuf[512];
-            for (int i = 0; i < 512; ++i) wbuf[i] = static_cast<uint8_t>(i ^ 0xA5);
-
-            core::watchdog::feed(main_wdt);
-            if (!emmc.cmd24_write_single(scratch, wbuf)) {
+        } else {
+            test_block = emmc.capacity_blocks() - 64;
+            if (!emmc.cmd25_write_multiple(test_block, wbuf, 8)) {
                 fail_stage = 2;
             } else {
-                core::watchdog::feed(main_wdt);
-                if (!emmc.read_blocks_sync(scratch, rbuf, 1)) {
+                // Spot-check block 1 via CMD17 (single-block path, confirmed working for CMD24).
+                // This disambiguates: if block 1 is wrong via CMD17, the WRITE is failing.
+                // If block 1 is correct via CMD17 but wrong via CMD18, the multi-block READ is failing.
+                if (!emmc.read_blocks_sync(test_block + 1, sblk, 1)) {
                     fail_stage = 3;
-                } else if (memcmp(wbuf, rbuf, 512) != 0) {
-                    fail_stage = 4;
+                } else if (sblk[0] != wbuf[512]) {
+                    // Block 1 byte 0 wrong via CMD17 → write is definitely failing for block 1.
+                    // T2 = upper nibble of actual flash value, T3 = lower nibble.
+                    fail_stage = 5;
+                    spot_actual = sblk[0];
+                } else {
+                    // Block 1 confirmed correct via CMD17. Now verify all 8 blocks via CMD18.
+                    if (!emmc.read_blocks_sync(test_block, rbuf, 8)) {
+                        fail_stage = 3;
+                    } else {
+                        for (int i = 0; i < 4096; ++i) {
+                            if (rbuf[i] != wbuf[i]) {
+                                fail_stage = 4;
+                                fail_byte = i;
+                                rbuf_bad_byte = rbuf[i];  // capture actual wrong value from CMD18
+                                break;
+                            }
+                        }
+                    }
                 }
             }
-            core::watchdog::feed(main_wdt);
-        }
-
-        if (fail_stage == 0) {
-            // PASS: all 4 track LEDs solid
-            for (int i = 0; i < leds::kNumTrack; ++i) g_leds.set_track(i, 255);
-        } else {
-            // FAIL: blink T1 N times (stage), pause, blink T2 M times (sub-error)
-            // Stage: 1=init 2=write 3=read 4=mismatch
-            // Sub (write only): 1=R1err 2=tx_timeout 3=no_token 4=bad_status 5=busy
-            for (int b = 0; b < fail_stage; ++b) {
-                g_leds.set_track(0, 255);
-                k_sleep(K_MSEC(300));
-                g_leds.set_track(0, 0);
-                k_sleep(K_MSEC(300));
-                core::watchdog::feed(main_wdt);
-            }
-            k_sleep(K_MSEC(800));
-            if (fail_stage == 2 && emmc.last_write_error > 0) {
-                for (int b = 0; b < emmc.last_write_error; ++b) {
-                    g_leds.set_track(1, 255);
-                    k_sleep(K_MSEC(300));
-                    g_leds.set_track(1, 0);
-                    k_sleep(K_MSEC(300));
-                    core::watchdog::feed(main_wdt);
-                }
-            }
-            k_sleep(K_MSEC(500));
-            g_leds.set_track(0, 255);
         }
         core::watchdog::feed(main_wdt);
-    }
 
-    // ── Power monitor ───────────────────────────────────────────
-    g_power.init();
-    core::watchdog::feed(main_wdt);
+        // Hold function button 3 s to power off from either terminal state.
+        int64_t fn_hold_start = 0;
+        auto poll_poweroff = [&]() {
+            const bool pressed = g_power.function_button_pressed();
+            const int64_t now = k_uptime_get();
+            if (pressed && fn_hold_start == 0) fn_hold_start = now;
+            if (!pressed) fn_hold_start = 0;
+            if (fn_hold_start != 0 && (now - fn_hold_start) >= 3000) {
+                g_leds.all_off();
+                sys_poweroff();
+            }
+        };
+
+        if (fail_stage == 0) {
+            for (int i = 0; i < leds::kNumTrack; ++i) g_leds.set_track(i, 255);
+            while (true) { core::watchdog::feed(main_wdt); poll_poweroff(); k_sleep(K_MSEC(100)); }
+        }
+
+        // FAIL: T1 blinks stage, T2 blinks sub-error
+        while (true) {
+            core::watchdog::feed(main_wdt);
+            poll_poweroff();
+            for (int b = 0; b < fail_stage; ++b) {
+                g_leds.set_track(0, 255); k_sleep(K_MSEC(300));
+                g_leds.set_track(0, 0);   k_sleep(K_MSEC(300));
+                core::watchdog::feed(main_wdt);
+                poll_poweroff();
+            }
+            k_sleep(K_MSEC(800));
+            core::watchdog::feed(main_wdt);
+            poll_poweroff();
+            int t2 = 0;
+            if (fail_stage == 2) t2 = emmc.last_write_error;
+            if (fail_stage == 4) t2 = (fail_byte >= 0) ? ((fail_byte >> 8) & 0xF) : 0;
+            if (fail_stage == 5) t2 = (spot_actual >> 4) & 0x0F;  // upper nibble of actual flash byte
+            for (int b = 0; b < t2; ++b) {
+                g_leds.set_track(1, 255); k_sleep(K_MSEC(300));
+                g_leds.set_track(1, 0);   k_sleep(K_MSEC(300));
+                core::watchdog::feed(main_wdt);
+                poll_poweroff();
+            }
+            // T3/T4: blink high byte of R1 as two nibbles when CMD25 returned R1 error
+            // T3 = bits 31-28 of R1 (upper nibble), T4 = bits 27-24 of R1 (lower nibble)
+            if (fail_stage == 2 && emmc.last_write_error == 11) {
+                k_sleep(K_MSEC(800));
+                core::watchdog::feed(main_wdt);
+                poll_poweroff();
+                const int t3 = static_cast<int>((emmc.last_failed_block_index >> 28) & 0x0F);
+                for (int b = 0; b < t3; ++b) {
+                    g_leds.set_track(2, 255); k_sleep(K_MSEC(300));
+                    g_leds.set_track(2, 0);   k_sleep(K_MSEC(300));
+                    core::watchdog::feed(main_wdt);
+                    poll_poweroff();
+                }
+                k_sleep(K_MSEC(800));
+                core::watchdog::feed(main_wdt);
+                poll_poweroff();
+                const int t4 = static_cast<int>((emmc.last_failed_block_index >> 24) & 0x0F);
+                for (int b = 0; b < t4; ++b) {
+                    g_leds.set_track(3, 255); k_sleep(K_MSEC(300));
+                    g_leds.set_track(3, 0);   k_sleep(K_MSEC(300));
+                    core::watchdog::feed(main_wdt);
+                    poll_poweroff();
+                }
+            }
+            // T3/T4: actual wrong byte value returned by CMD18 at rbuf[fail_byte].
+            // T2 = upper nibble of fail_byte index (still shows WHICH byte failed).
+            // T3 = upper nibble of actual CMD18 value, T4 = lower nibble.
+            // Decode: actual = (T3 << 4) | T4. Expected block 1 byte 0 = 0x26.
+            // 0xFF = DMA never reached that address (block not received).
+            // 0x01 = block 0's byte 0 (CMD18 sent block 0 twice instead of advancing).
+            // 0x13 = 0x26 >> 1 (1-bit right shift = start-bit alignment off by 1).
+            if (fail_stage == 4 && fail_byte >= 0) {
+                k_sleep(K_MSEC(800));
+                core::watchdog::feed(main_wdt);
+                poll_poweroff();
+                const int t3 = (rbuf_bad_byte >> 4) & 0x0F;
+                for (int b = 0; b < t3; ++b) {
+                    g_leds.set_track(2, 255); k_sleep(K_MSEC(300));
+                    g_leds.set_track(2, 0);   k_sleep(K_MSEC(300));
+                    core::watchdog::feed(main_wdt);
+                    poll_poweroff();
+                }
+                k_sleep(K_MSEC(800));
+                core::watchdog::feed(main_wdt);
+                poll_poweroff();
+                const int t4 = rbuf_bad_byte & 0x0F;
+                for (int b = 0; b < t4; ++b) {
+                    g_leds.set_track(3, 255); k_sleep(K_MSEC(300));
+                    g_leds.set_track(3, 0);   k_sleep(K_MSEC(300));
+                    core::watchdog::feed(main_wdt);
+                    poll_poweroff();
+                }
+            }
+            // fail_stage=5: block 1 wrong via CMD17 (write confirmed bad).
+            // T2 = upper nibble of actual flash byte (already blinked above).
+            // T3 = lower nibble of actual flash byte.
+            // Decode: actual = (T2 << 4) | T3.
+            // Expected block 1 byte 0 = 0x26 (block-unique pattern).
+            // 0xFF = never written (erased state). 0x5A = old repeating-pattern data.
+            if (fail_stage == 5) {
+                k_sleep(K_MSEC(800));
+                core::watchdog::feed(main_wdt);
+                poll_poweroff();
+                const int t3_spot = spot_actual & 0x0F;
+                for (int b = 0; b < t3_spot; ++b) {
+                    g_leds.set_track(2, 255); k_sleep(K_MSEC(300));
+                    g_leds.set_track(2, 0);   k_sleep(K_MSEC(300));
+                    core::watchdog::feed(main_wdt);
+                    poll_poweroff();
+                }
+            }
+            // T3×1 = CRC error (0b101), T3×2 = write error (0b110)
+            if (fail_stage == 2 && emmc.last_write_error == 4) {
+                k_sleep(K_MSEC(800));
+                core::watchdog::feed(main_wdt);
+                poll_poweroff();
+                const int t3 = (emmc.last_write_response_status == 0b101U) ? 1 : 2;
+                for (int b = 0; b < t3; ++b) {
+                    g_leds.set_track(2, 255); k_sleep(K_MSEC(300));
+                    g_leds.set_track(2, 0);   k_sleep(K_MSEC(300));
+                    core::watchdog::feed(main_wdt);
+                    poll_poweroff();
+                }
+            }
+            k_sleep(K_MSEC(800));
+            core::watchdog::feed(main_wdt);
+            poll_poweroff();
+            k_sleep(K_MSEC(700));
+        }
+    }
 
     // ── Fader ADC ───────────────────────────────────────────────
     for (const auto* spec : {&fader1_adc, &fader2_adc, &fader3_adc, &fader4_adc}) {
