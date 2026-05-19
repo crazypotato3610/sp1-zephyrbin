@@ -1499,20 +1499,6 @@ bool EmmcDriver::cmd24_write_single(uint32_t block_addr, const uint8_t* data) {
     return send_data_block(data, 0xFE);
 }
 
-bool EmmcDriver::send_stop_tran() {
-    // Must be stack-local non-const — EasyDMA cannot read from flash .rodata
-    uint8_t stop_bytes[] = {0xFF, 0xFD, 0xFF};
-    if (!spim3_transmit_bytes(stop_bytes, 3)) {
-        last_write_error = 20;
-        return false;
-    }
-    if (!wait_write_busy()) {
-        last_write_error = 21;
-        return false;
-    }
-    return true;
-}
-
 bool EmmcDriver::cmd25_write_multiple(uint32_t block_addr, const uint8_t* data, uint32_t num_blocks) {
     last_write_error = 0;
     last_failed_block_index = 0;

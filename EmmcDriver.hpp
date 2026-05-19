@@ -219,7 +219,6 @@ private:
     bool read_write_response();
     bool wait_write_busy();
     bool send_data_block(const uint8_t* data, uint8_t start_token);
-    bool send_stop_tran();
 
     // Async read IRQ state — unchanged from previous implementation.
     enum class AsyncReadState : uint8_t {
